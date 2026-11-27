@@ -26,6 +26,9 @@ import {
   readProxyDecisionForPort,
   isDirectSource,
   probeThroughForwarder,
+  readPatchRecord,
+  autoHealPatch,
+  shouldHeal,
   writeVerifyRecord,
   readVerifyRecord,
   stateDir,
@@ -104,6 +107,36 @@ function cmdStatus () {
   out()
   out(C.dim(`日志：${log}`))
   return report
+}
+
+function cmdHeal () {
+  const located = locateForwarderEntry(process.env)
+  if (!located) {
+    out(C.bad('未找到 billion-context 安装；可用 BILI_CONTEXT_DIR 指定'))
+    process.exitCode = 2
+    return
+  }
+  const record = readPatchRecord()
+  out(C.bold('升级自愈'))
+  out(`  安装   ${located.root}`)
+  out(`  版本   ${readVersion(located.root)}${record && record.version !== readVersion(located.root) ? C.warn(`  (上次记录 ${record.version})`) : ''}`)
+  const check = shouldHeal(process.env)
+  out(`  检查   ${check.needed ? C.warn(`需要重打（${check.reason}）`) : C.ok(`无需处理（${check.reason}）`)}`)
+  if (!check.needed) return
+  const result = autoHealPatch(process.env, { reason: 'cli', force: true })
+  if (result.action === 'patched') {
+    out(C.ok(`  已重打：${result.before ? result.before.slice(0, 12) : '?'} → ${result.after ? result.after.slice(0, 12) : '?'}`))
+    if (result.versionChanged) out(`  版本   ${result.previousVersion} → ${result.version}`)
+    if (result.backup) out(`  备份   ${result.backup}`)
+    out()
+    out(C.warn('需要重启 DSH 才生效。'))
+  } else if (result.action === 'already') {
+    out(C.ok('  已经是打好的状态'))
+  } else {
+    out(C.bad(`  不能重打：${result.reason ?? result.action}`))
+    if (result.rolledBack) out(C.dim('  已回滚，磁盘文件未被改动。'))
+    process.exitCode = 3
+  }
 }
 
 function cmdPatch () {
@@ -301,6 +334,7 @@ function cmdWatch () {
 
 const commands = {
   status: cmdStatus,
+  heal: cmdHeal,
   patch: cmdPatch,
   revert: cmdRevert,
   verify: cmdVerify,

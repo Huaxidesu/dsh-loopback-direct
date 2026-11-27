@@ -1,6 +1,6 @@
 {
   "name": "dsh-loopback-direct",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "让 DSH 的 WorkBuddy 等本机模型在开启手动代理后仍然直连：给 billion-context 转发器的第二跳补上回环地址分流",
   "type": "module",
   "license": "MIT",

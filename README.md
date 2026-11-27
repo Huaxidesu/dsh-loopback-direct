@@ -30,6 +30,34 @@ if(target&&/^(?:localhost\.?|127\.…|\[::1\]|\[::ffff:127\..*\])$/i.test(target
 2. **端口无关**：判定的是 hostname，不是完整 URL，所以 shim 换端口自动生效。
 3. **不用转发器自带的 `hostIsLoopback()`**：它用 `startsWith("127.")`，会把 `127.0.0.1.example.org` 这类公网域名也判成回环。这里用严格正则。
 
+## 升级监护（billion-context 升级后仍然可用）
+
+`billion-context` 升级会覆盖 `dist/index.js`，我们打的那一行补丁随之消失 —— 表现就是
+手动代理一开，本机模型又开始 `502 proxy-reset`。
+
+插件带一层**升级监护**：每次打开设置页（或读一次 `/plugins/dsh-loopback-direct/status`）都会
+
+1. 用 `stat(size+mtime)` 判断源码有没有被替换过，**没变就不读那个 6 MB 文件**；
+2. 变了就重新校验锚点唯一性，锚点还在就**自动把补丁补回去**，并记下「从哪个版本升到哪个版本」；
+3. 锚点没了（上游改了这段逻辑）就**拒绝动手**并把状态标成「需要重打」，绝不往源码里塞半对的东西；
+4. 补完后做两道语法校验：差分还原校验（去掉补丁行后能否逐字节还原原文）+ `node --check`。
+   任何一道不过立刻回滚，不留坏文件。沙箱里 `spawn` 被禁时会降级成「未校验」而不是误报失败。
+
+打补丁后的状态记录在 `~/.local/state/billion-context/dsh-loopback-direct-patch.json`
+（`version` / `patchedHash` / `lastHealFrom` / `lastHealTo` 等），所以 DSH 重启后
+设置页仍然看得出「刚经历过一次升级」。
+
+设置页会显示**「插件已升级，补丁已自动重打」**的橙色徽标和一句
+`billion-context 已从 X 升级到 Y，回环分流已自动补回 —— 需要重启 DSH 才生效`。
+守卫只负责把磁盘上的补丁补回来，**进程里的转发器还得重启 DSH 才会跑新代码**。
+
+关掉守卫：`DSH_LOOPBACK_DIRECT_NO_AUTOHEAL=1`。
+
+```bash
+# 手动看一次升级监护的判断结果
+node cli.js heal
+```
+
 ## 用法
 
 ```bash

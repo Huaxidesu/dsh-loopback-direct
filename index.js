@@ -28,6 +28,11 @@ import {
   probeThroughForwarder,
   readVerifyRecord,
   writeVerifyRecord,
+  readPatchRecord,
+  writePatchRecord,
+  autoHealPatch,
+  shouldHeal,
+  PATCH_LINE,
   stateDir,
 } from './lib/core.js'
 
@@ -35,6 +40,56 @@ const NAME = 'dsh-loopback-direct'
 const STATUS_PATH = `/plugins/${NAME}/status`
 const ACTION_PATH = `/plugins/${NAME}/action`
 const KNOWN_VERSION_NOTE = '0.1.216 已实测；其它版本请先看 status 的 patchable 字段'
+/** 版本守卫的巡检间隔：billion-context 在会话中途被升级也能在半分钟内自愈。 */
+const HEAL_INTERVAL_MS = 30 * 1000
+
+/**
+ * 版本守卫状态（模块级，供 status 展示）。
+ *  - lastHeal : 最近一次自愈结果
+ *  - healedCount : 本进程启动以来自动重新打补丁的次数
+ */
+const guard = { lastHeal: undefined, lastAt: 0, healedCount: 0 }
+const statCache = new Map()
+
+/**
+ * 跑一次版本守卫：billion-context 被升级 → dist/index.js 换成未打补丁的新源码 → 自动重新打。
+ * 幂等、静默、不抛；真要改盘时把结果记进 guard.lastHeal 给 UI 看。
+ */
+function runGuard (reason) {
+  let look
+  try {
+    look = shouldHeal(process.env, statCache)
+  } catch (error) {
+    return { action: 'blocked', reason: 'guard-error', error: String(error && error.message ? error.message : error) }
+  }
+  if (!look.needed) {
+    if (look.reason === 'already-patched') {
+      statCache.set(look.entry, look.signature)
+      const report = diagnose(process.env)
+      guard.lastHeal = {
+        action: 'already',
+        version: report.install && report.install.version,
+        at: new Date().toISOString(),
+        reason: 'already-patched',
+      }
+      guard.lastAt = Date.now()
+    }
+    return guard.lastHeal
+  }
+  const result = autoHealPatch(process.env, { reason })
+  if (result.action === 'patched') {
+    guard.healedCount += 1
+    if (look.entry) statCache.delete(look.entry)
+  }
+  guard.lastHeal = { ...result, at: new Date().toISOString() }
+  guard.lastAt = Date.now()
+  if (result.action === 'patched' || result.action === 'already') {
+    console.log(`[${NAME}] 版本守卫：billion-context ${result.version ?? '?'} ${result.action === 'patched' ? '已自动重新打补丁' : '补丁就位'}${result.versionChanged ? `（上一次是 ${result.previousVersion}）` : ''}`)
+  } else {
+    console.warn(`[${NAME}] 版本守卫：无法自动打补丁（${result.reason}${result.error ? `: ${result.error}` : ''}），请在设置页手动处理`)
+  }
+  return guard.lastHeal
+}
 
 /** 只允许本机回环访问，避免把补丁管理暴露到局域网。 */
 function requireLoopback (req, res) {
@@ -86,13 +141,41 @@ async function currentUpstream (origin) {
   return upstreamCache
 }
 
+/**
+ * 本轮守卫结果与磁盘记录的二选一。
+ *
+ * 本轮守卫没跑（被关掉，或这一轮什么也不用做）时，用记录里那次自愈的信息，
+ * 但只在「记录里的版本就是当前磁盘版本」时才认，否则会显示过期的提示。
+ */
+function currentHeal (heal, patchRecord) {
+  if (heal !== undefined && heal.action === 'patched') return heal
+  if (heal !== undefined && heal.action === 'blocked') return heal
+  if (patchRecord === undefined || patchRecord === null) return heal ?? null
+  if (typeof patchRecord.lastHealTo !== 'string' || patchRecord.lastHealTo !== patchRecord.version) return heal ?? null
+  if (patchRecord.version !== readVersion(locateForwarderEntry(process.env)?.root ?? '')) return heal ?? null
+  return {
+    action: 'patched',
+    version: patchRecord.version,
+    versionChanged: patchRecord.lastHealFrom !== undefined && patchRecord.lastHealFrom !== patchRecord.version,
+    previousVersion: patchRecord.lastHealFrom,
+    at: patchRecord.lastHealAt,
+    reason: patchRecord.lastHealReason,
+    from: 'record',
+  }
+}
+
 /** 完整状态：诊断 + 该回环端口的最近决策 + 上一次真实验证的结论。 */
 export async function buildStatus () {
+  // 每次取状态先跑一遍版本守卫：这是最可靠的时机 —— 用户打开设置页、刷新、点任何按钮都会经过这里。
+  // 想只看诊断不自动修复就设 DSH_LOOPBACK_DIRECT_NO_AUTOHEAL=1。
+  const autoHeal = process.env.DSH_LOOPBACK_DIRECT_NO_AUTOHEAL !== '1'
+  const heal = autoHeal ? runGuard('status') : undefined
   const report = diagnose(process.env)
   const inst = report.install
   const running = report.forwarder !== undefined
   const patched = Boolean(inst && inst.patched)
   const record = readVerifyRecord()
+  const patchRecord = readPatchRecord()
   const fingerprint = running ? report.forwarder.codeFingerprint : undefined
   // 当前真实的回环端口：验证记录只有对得上这个端口才算数（shim 换端口后必须重验）。
   const live = running ? await currentUpstream(report.forwarder.origin.replace(/\/+$/, '')) : { port: undefined, mode: undefined }
@@ -110,6 +193,17 @@ export async function buildStatus () {
     portMatches &&
     // 代理模式变了，上一次的验证证据就不再代表当前状态。
     (live.mode === undefined || record.mode === undefined || record.mode === live.mode)
+  // 刚自愈过（版本变了、补丁重打）。只有补丁后的磁盘代码与运行中实例不一致时才真的要重启：
+  // 模拟/重灌同版本时磁盘内容可能和运行中实例完全相同，这时重启没有意义。
+  const healedNow = heal !== undefined && heal.action === 'patched'
+  // 注意顺序：守卫先跑、写入了新记录，diagnose 读到的已经是「修复后」的状态，
+  // 所以版本是否变过必须从这一轮守卫的结果里取，不能只看 diagnose。
+  const versionChanged = Boolean(inst && inst.versionChanged) || (heal !== undefined && heal.versionChanged === true)
+  // 守卫先跑并写入新记录，diagnose 读到的 previousVersion 已经是「本轮刚写的」，
+  // 所以只要本轮真的重打过，就必须用守卫自己抓到的升级前版本。
+  const previousVersion = (heal !== undefined && heal.versionChanged === true)
+    ? heal.previousVersion
+    : ((inst && inst.previousVersion) ?? (heal !== undefined ? heal.previousVersion : undefined))
   return {
     ok: true,
     plugin: NAME,
@@ -118,6 +212,15 @@ export async function buildStatus () {
     install: inst ?? null,
     lastDecision: decision ?? null,
     verify: record ?? null,
+    patchRecord: patchRecord ?? null,
+    guard: {
+      enabled: autoHeal,
+      // 本轮跑出来的结果优先；进程刚起来还没有结果时，回退到磁盘上记着的那次自愈，
+      // 这样重启后用户仍然能看到「升级后补丁已自动补回」。
+      last: currentHeal(heal, patchRecord),
+      healedCount: guard.healedCount,
+      lastAt: guard.lastAt ? new Date(guard.lastAt).toISOString() : null,
+    },
     livePort: livePort ?? null,
     liveMode: live.mode ?? null,
     flags: {
@@ -125,6 +228,9 @@ export async function buildStatus () {
       patched,
       patchable: Boolean(inst && inst.patchable),
       restartPending: Boolean(inst && inst.entryFingerprintMatchesRunning === false),
+      healedNow,
+      versionChanged,
+      previousVersion: previousVersion ?? null,
       verified: Boolean(record && record.ok === true && record.confirmed === true),
       portMatches,
       modeMatches: live.mode === undefined || record === undefined || record.mode === undefined || record.mode === live.mode,
@@ -181,16 +287,49 @@ function doPatch () {
   if (!located) return { ok: false, reason: 'install-not-found' }
   const source = fs.readFileSync(located.entry, 'utf8')
   const state = inspectSource(source, readVersion(located.root))
-  if (state.patched) return { ok: true, changed: false, reason: 'already-patched' }
-  if (!state.patchable) return { ok: false, reason: state.reason }
-  const result = applyPatchOnDisk(located.entry)
-  return { ok: true, changed: result.changed, reason: result.reason, before: result.before, after: result.after, backup: result.backup, restartRequired: true }
+  // 已打过但行数异常（多行/旧版正则）→ 归一化一次，不留重复分流。
+  if (state.patched && state.routeLineCount === 1 && source.includes(PATCH_LINE)) {
+    runGuard('manual-nudge')
+    return { ok: true, changed: false, reason: 'already-patched', routeLineCount: state.routeLineCount }
+  }
+  if (!state.patched && !state.patchable) return { ok: false, reason: state.reason }
+  const result = autoHealPatch(process.env, { reason: 'manual', force: true })
+  if (result.action === 'blocked' || result.action === 'not-found') {
+    return { ok: false, reason: result.reason ?? result.action, version: result.version }
+  }
+  runGuard('manual-after')
+  return {
+    ok: true,
+    changed: result.action === 'patched',
+    reason: result.action === 'patched' ? (state.patched ? 'normalized' : 'patched') : 'already-patched',
+    before: result.before,
+    after: result.after,
+    backup: result.backup,
+    version: result.version,
+    versionChanged: result.versionChanged,
+    previousVersion: result.previousVersion,
+    routeLineCount: result.routeLineCount,
+    restartRequired: result.action === 'patched',
+  }
 }
 
 function doRevert () {
   const located = locateForwarderEntry(process.env)
   if (!located) return { ok: false, reason: 'install-not-found' }
   const result = rollbackOnDisk(located.entry)
+  // 用户主动回滚 = 明确不要补丁：清掉记录，否则版本守卫会在下一次 status 里又打回去。
+  if (result.changed) {
+    writePatchRecord({
+      version: readVersion(located.root),
+      patchedHash: undefined,
+      at: new Date().toISOString(),
+      auto: false,
+      reason: 'user-reverted',
+    })
+    guard.lastHeal = { action: 'reverted', at: new Date().toISOString() }
+    guard.lastAt = Date.now()
+    statCache.delete(located.entry)
+  }
   return { ok: true, changed: result.changed, reason: result.reason, before: result.before, after: result.after, backups: result.backups, restartRequired: result.changed }
 }
 

@@ -54,6 +54,12 @@ window.__ModuleLoader__.load({
       hintConfirmed: '转发器日志已确认回环目标直连。',
       unknownVersion: '未列入已验证版本，请先点「验证」。',
       cli: '命令行：node cli.js status | patch | revert | verify',
+      upgraded: '插件已升级，补丁已自动重打',
+      hintUpgraded: 'billion-context 已从 {from} 升级到 {to}，回环分流已自动补回。因为转发器是独立进程，需要重启 DSH 才生效。',
+      hintGuardBlocked: '已升级到 {to}，但新版本的补丁锚点变了，自动重打被拦下（{reason}）。请等插件适配后再试。',
+      guard: '升级监护',
+      guardOn: '已开启（每次打开本页都会检查）',
+      healedTimes: '已自动重打 {n} 次',
     }
 
     const en = {
@@ -93,6 +99,12 @@ window.__ModuleLoader__.load({
       hintConfirmed: 'The forwarder log confirms loopback traffic goes direct.',
       unknownVersion: 'Not a verified version; run Verify first.',
       cli: 'CLI: node cli.js status | patch | revert | verify',
+      upgraded: 'Forwarder upgraded, patch re-applied',
+      hintUpgraded: 'billion-context was upgraded from {from} to {to}. The loopback routing was re-applied automatically. The forwarder is a separate process, so restart DSH for it to take effect.',
+      hintGuardBlocked: 'Upgraded to {to}, but the patch anchor changed so auto re-patching was refused ({reason}). Wait for a plugin update that supports this version.',
+      guard: 'Upgrade guard',
+      guardOn: 'Enabled (checked every time this page opens)',
+      healedTimes: 'Auto re-patched {n} time(s)',
     }
 
     const S = {
@@ -195,7 +207,18 @@ window.__ModuleLoader__.load({
       const inst = status.install
       const decision = status.lastDecision
 
+      // 升级守护的结论优先显示：用户最关心的是「升级后还能不能直连」。
+      const guardLast = status.guard && status.guard.last
+      const healed = Boolean(guardLast && guardLast.action === 'patched')
+      const guardBlocked = Boolean(guardLast && guardLast.action === 'blocked')
+      const fmtHint = (text, vars) => Object.keys(vars).reduce((acc, key) => acc.split(`{${key}}`).join(String(vars[key] ?? '?')), text)
+
       const hints = []
+      if (healed) {
+        hints.push(fmtHint(t('hintUpgraded'), { from: guardLast.previousVersion || '?', to: guardLast.version || '?' }))
+      } else if (guardBlocked && f.versionChanged) {
+        hints.push(fmtHint(t('hintGuardBlocked'), { to: guardLast.version || '?', reason: guardLast.reason || '?' }))
+      }
       if (!f.running) hints.push(t('hintNoForwarder'))
       if (!inst || !inst.found) hints.push(t('hintNoInstall'))
       if (f.restartPending) hints.push(t('hintRestart'))
@@ -208,7 +231,8 @@ window.__ModuleLoader__.load({
         h('div', { style: S.card },
           h('div', { style: S.row },
             h(Badge, { tone: f.confirmed ? 'ok' : f.patched ? 'warn' : 'bad' },
-              f.confirmed ? t('confirmed') : t('notConfirmed'))),
+              f.confirmed ? t('confirmed') : t('notConfirmed')),
+            healed ? h(Badge, { tone: 'warn' }, t('upgraded')) : null),
           h(Row, { label: t('forwarder') },
             status.forwarder
               ? `${status.forwarder.origin}${status.forwarder.pid ? `  pid=${status.forwarder.pid}` : ''}`
@@ -219,6 +243,10 @@ window.__ModuleLoader__.load({
             h(Badge, { tone: f.patched ? 'ok' : f.patchable ? 'warn' : 'bad' },
               f.patched ? t('patched') : f.patchable ? t('patchable') : t('notPatchable'))),
           f.restartPending ? h('div', null, h(Badge, { tone: 'warn' }, t('restartPending'))) : null,
+          status.guard
+            ? h(Row, { label: t('guard') },
+                `${status.guard.enabled ? t('guardOn') : 'off'}${status.guard.healedCount ? `  \u00b7  ${fmtHint(t('healedTimes'), { n: status.guard.healedCount })}` : ''}`)
+            : null,
           h(Row, { label: t('lastDecision') },
             decision ? `${decision.host}  ${decision.via}  (source=${decision.source})` : t('none')),
 

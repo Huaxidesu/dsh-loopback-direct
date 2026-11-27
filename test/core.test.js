@@ -1,5 +1,8 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 
 import {
   PATCH_LINE,
@@ -14,6 +17,12 @@ import {
   readProxyDecisionForPort,
   parseProxyDecisionLine,
   isDirectSource,
+  countRouteLines,
+  nodeSyntaxCheck,
+  autoHealPatch,
+  shouldHeal,
+  readPatchRecord,
+  writePatchRecord,
 } from '../lib/core.js'
 
 /** 构造一份和真实 dist/index.js 同形的最小样本。 */
@@ -96,9 +105,15 @@ test('回滚移除插入行并恢复原样', () => {
 
 test('打补丁后的源码括号配平', () => {
   const patched = applyPatchToSource(sample()).source
-  assert.deepEqual(syntaxCheck(patched), { ok: true })
-  assert.equal(syntaxCheck('function f(){').ok, false)
-  assert.equal(syntaxCheck('const a = "unterminated').ok, false)
+  // syntaxCheck 的职责是「补丁必须是纯插入」：去掉插入行后必须逐字节回到原文。
+  const check = syntaxCheck(patched)
+  assert.equal(check.ok, true)
+  assert.equal(check.mode, 'round-trip')
+  // 没有补丁行的源码不算「补丁有问题」，只是没东西可校验。
+  assert.equal(syntaxCheck(sample()).mode, 'untouched')
+  // 补丁行被人手工改坏（多插了一行）必须被拒。
+  const doubled = patched.replace(PATCH_LINE, PATCH_LINE + PATCH_LINE)
+  assert.equal(syntaxCheck(doubled).ok, false)
 })
 
 test('解析 bili.log 的最后一条 upstream-proxy 决策', () => {
@@ -153,4 +168,197 @@ test('解析单行决策并抽取端口（含远端无端口的情况）', () =>
 test('直连来源标签判定', () => {
   for (const s of ['loopback-direct', 'provider-direct', 'direct', 'no-proxy']) assert.equal(isDirectSource(s), true, s)
   for (const s of ['web-manual', 'provider', 'global', 'auto', '', undefined]) assert.equal(isDirectSource(s), false, String(s))
+})
+
+
+// ── 版本守卫 ────────────────────────────────────────────────────────────────
+// 用的是「插件自己升级后 PATCH_LINE 文本变了」的场景：只要还是那行分流语句，
+// 就必须被认成已打补丁，否则会再插一行 → 重复分流。
+
+test('countRouteLines 认得旧版本行文本', () => {
+  const oldShape = 'if(target&&/^(?:localhost|127\\.0\\.0\\.1)$/i.test(target.hostname))return{source:"loopback-direct"};'
+  assert.equal(countRouteLines(sample(oldShape)), 1)
+  assert.equal(countRouteLines(sample(PATCH_LINE)), 1)
+  assert.equal(countRouteLines(sample()), 0)
+})
+
+test('重复插入的行会被数出来，inspectSource 标记 patched-duplicate', () => {
+  const twice = sample(PATCH_LINE + PATCH_LINE.replace('if(target&&/', 'if(target&&/'))
+  assert.equal(countRouteLines(twice), 2)
+  const state = inspectSource(twice, '0.1.216')
+  assert.equal(state.patched, true)
+  assert.equal(state.routeLineCount, 2)
+  assert.equal(state.patchable, false)
+  assert.match(state.reason, /patched-duplicate/)
+})
+
+test('applyPatchToSource 把两行归一化回一行（幂等修复）', () => {
+  const twice = sample(PATCH_LINE + PATCH_LINE.replace('if(target&&/', 'if(target&&/'))
+  const fixed = applyPatchToSource(twice)
+  assert.equal(fixed.changed, true)
+  assert.equal(countRouteLines(fixed.source), 1)
+  assert.equal(inspectSource(fixed.source, '0.1.216').patched, true)
+})
+
+test('插件升级后行文本变了也算已打补丁，不会重复插入', () => {
+  const oldShape = 'if(target&&/^(?:localhost|127\\.0\\.0\\.1)$/i.test(target.hostname))return{source:"loopback-direct"};'
+  const state = inspectSource(sample(oldShape), '0.1.216')
+  assert.equal(state.patched, true)
+  assert.equal(state.patchable, false)
+  // 再打一次只是换成当前文本，不会变成两行
+  const next = applyPatchToSource(sample(oldShape))
+  assert.equal(countRouteLines(next.source), 1)
+})
+
+test('补丁记录可写可读，损坏时安全回退', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lb-guard-'))
+  const env = { ...process.env, XDG_STATE_HOME: dir }
+  assert.equal(readPatchRecord(env), undefined)
+  writePatchRecord({ version: '0.1.216', patchedHash: 'abc', auto: true }, env)
+  const back = readPatchRecord(env)
+  assert.equal(back.version, '0.1.216')
+  assert.equal(back.patchedHash, 'abc')
+  fs.writeFileSync(path.join(dir, 'billion-context', 'dsh-loopback-direct-patch.json'), '{not json')
+  assert.equal(readPatchRecord(env), undefined)
+})
+
+
+// ── 升级自愈（用假的 billion-context 安装目录，绝不碰真机） ──────────────────
+function fakeInstall ({ source = sample(), version = '0.1.216' } = {}) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'lb-heal-'))
+  fs.mkdirSync(path.join(root, 'dist'), { recursive: true })
+  fs.writeFileSync(path.join(root, 'dist', 'index.js'), source)
+  fs.writeFileSync(path.join(root, 'package.json'), JSON.stringify({ name: 'billion-context', version, main: 'dist/index.js' }))
+  const state = fs.mkdtempSync(path.join(os.tmpdir(), 'lb-state-'))
+  return {
+    root,
+    state,
+    env: { ...process.env, BILI_CONTEXT_DIR: root, XDG_STATE_HOME: state },
+    entry: path.join(root, 'dist', 'index.js'),
+  }
+}
+
+test('升级把源码换回未打补丁 → 守卫检测到并自动重打', () => {
+  const inst = fakeInstall()
+  const first = autoHealPatch(inst.env, { reason: 'test' })
+  assert.equal(first.action, 'patched')
+  assert.ok(fs.readFileSync(inst.entry, 'utf8').includes('loopback-direct'))
+  // 模拟 npm 升级：整份 dist/index.js 被替换成未打补丁的新版本
+  fs.writeFileSync(inst.entry, sample(''), 'utf8')
+  fs.writeFileSync(path.join(inst.root, 'package.json'), JSON.stringify({ name: 'billion-context', version: '0.1.300' }))
+  const again = autoHealPatch(inst.env, { reason: 'upgrade' })
+  assert.equal(again.action, 'patched')
+  assert.equal(again.versionChanged, true)
+  assert.equal(again.previousVersion, '0.1.216')
+  assert.equal(again.version, '0.1.300')
+  assert.ok(fs.readFileSync(inst.entry, 'utf8').includes('loopback-direct'))
+  // 补丁记录跟着更新
+  const rec = readPatchRecord(inst.env)
+  assert.equal(rec.version, '0.1.300')
+})
+
+test('已经打好补丁时守卫不做任何改动', () => {
+  const inst = fakeInstall()
+  autoHealPatch(inst.env, { reason: 'test' })
+  const before = fs.readFileSync(inst.entry, 'utf8')
+  const again = autoHealPatch(inst.env, { reason: 'test' })
+  assert.equal(again.action, 'already')
+  assert.equal(fs.readFileSync(inst.entry, 'utf8'), before)
+})
+
+test('新版本锚点不存在 → 拒绝打补丁且不动文件（升级不可自动修复时必须安全失败）', () => {
+  const inst = fakeInstall()
+  autoHealPatch(inst.env, { reason: 'test' })
+  // 上游重写：锚点消失
+  const rewritten = sample().replace('if(globalProxy===""&&fallback.explicitDirect){', 'if(globalProxy.length===0&&fallback.explicitDirect){')
+  fs.writeFileSync(inst.entry, rewritten, 'utf8')
+  const blocked = autoHealPatch(inst.env, { reason: 'upgrade' })
+  assert.equal(blocked.action, 'blocked')
+  assert.equal(blocked.reason, 'anchor-missing')
+  assert.equal(fs.readFileSync(inst.entry, 'utf8'), rewritten)
+})
+
+test('语法检查不通过时自动回滚，不留下坏文件', () => {
+  // 少一个右括号：插入补丁行之后 syntaxCheck 必然失败
+  const broken = sample().replace('return autoDetectProxy(target,fallback)}', 'return autoDetectProxy(target,fallback)')
+  const inst = fakeInstall({ source: broken })
+  const blocked = autoHealPatch(inst.env, { reason: 'test' })
+  assert.equal(blocked.action, 'blocked')
+  assert.equal(blocked.rolledBack, true)
+  assert.match(blocked.reason, /syntax-check-failed/)
+  // 磁盘上必须还是那份没被碰过的原始字节
+  assert.equal(fs.readFileSync(inst.entry, 'utf8'), broken)
+  assert.ok(!fs.readFileSync(inst.entry, 'utf8').includes('loopback-direct'))
+  // 而且不能留下补丁记录，否则下次会以为已经打好了
+  assert.equal(readPatchRecord(inst.env), undefined)
+})
+
+test('shouldHeal 靠 stat 缓存避免每次状态请求都读 6MB 源码', () => {
+  const inst = fakeInstall()
+  autoHealPatch(inst.env, { reason: 'test' })
+  const cache = new Map()
+  const first = shouldHeal(inst.env, cache)
+  assert.equal(first.needed, false)
+  assert.equal(first.reason, 'already-patched')
+  const second = shouldHeal(inst.env, cache)
+  assert.equal(second.reason, 'unchanged')
+  assert.equal(cache.size > 0, true)
+})
+
+
+test('nodeSyntaxCheck 能真的让 Node 判定语法（不可用时降级而不是误报）', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lb-syntax-'))
+  const good = path.join(dir, 'good.mjs')
+  const bad = path.join(dir, 'bad.mjs')
+  fs.writeFileSync(good, 'export const a = 1\n', 'utf8')
+  fs.writeFileSync(bad, 'export const a = (((\n', 'utf8')
+  const okResult = nodeSyntaxCheck(good)
+  assert.equal(okResult.ok, true)
+  if (okResult.checked) {
+    const badResult = nodeSyntaxCheck(bad)
+    assert.equal(badResult.ok, false)
+    assert.equal(badResult.checked, true)
+  } else {
+    // 沙箱里 spawn 被拒时必须是 checked:false（降级），不能把「查不了」当失败
+    assert.match(okResult.reason, /spawn-unavailable/)
+  }
+})
+
+
+test('第一次装（已打补丁但没有记录）会写入基线记录，之后升级才认得出变了', () => {
+  const inst = fakeInstall()
+  // 手工把补丁打进磁盘，但不写记录 —— 模拟「插件刚装上、用户早就打过补丁」
+  const patched = applyPatchToSource(sample()).source
+  fs.writeFileSync(inst.entry, patched, 'utf8')
+  assert.equal(readPatchRecord(inst.env), undefined)
+  const first = shouldHeal(inst.env, new Map())
+  assert.equal(first.needed, true)
+  assert.equal(first.reason, 'record-missing')
+  const heal = autoHealPatch(inst.env, { reason: 'baseline' })
+  assert.equal(heal.action, 'already')
+  assert.equal(readPatchRecord(inst.env).version, '0.1.216')
+  // 基线建立之后就不该反复触发
+  assert.equal(shouldHeal(inst.env, new Map()).reason, 'already-patched')
+})
+
+test('已打补丁时二次检查不会抹掉上一次自愈的痕迹', () => {
+  const inst = fakeInstall()
+  const first = autoHealPatch(inst.env)
+  assert.equal(first.action, 'patched')
+
+  const rec = readPatchRecord(inst.env)
+  writePatchRecord({
+    ...rec,
+    lastHealAt: '2026-01-01T00:00:00.000Z',
+    lastHealReason: 'status',
+    lastHealFrom: '0.1.100',
+    lastHealTo: rec.version,
+  }, inst.env)
+
+  const again = autoHealPatch(inst.env)
+  assert.equal(again.action, 'already')
+
+  const after = readPatchRecord(inst.env)
+  assert.equal(after.lastHealFrom, '0.1.100')
+  assert.equal(after.lastHealAt, '2026-01-01T00:00:00.000Z')
 })
