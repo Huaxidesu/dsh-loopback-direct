@@ -18,6 +18,7 @@ const getRef = `/git/ref/tags/${tag}`
 const commitRef = { object: { type: 'commit', sha: commit } }
 const zipName = 'dsh-loopback-direct-offline.zip'
 const zipUrl = `${origin}/releases/download/${tag}/${zipName}`
+const publicLatest = `${origin}/releases/latest`
 
 await test('offers the offline ZIP only when the same release has the expected asset', async () => {
   for (const [assets, expected] of [
@@ -38,8 +39,8 @@ function fixture (replies, options = {}) {
   const seen = []
   const fetchImpl = async (url, init) => {
     seen.push({ url, init })
-    const reply = replies.get(url.slice(api.length))
-    assert.ok(url.startsWith(`${api}/`) && reply !== undefined, `unexpected fetch ${url}`)
+    const reply = replies.get(url.startsWith(`${api}/`) ? url.slice(api.length) : url)
+    assert.notEqual(reply, undefined, `unexpected fetch ${url}`)
     if (reply instanceof Error) throw reply
     return typeof reply === 'function' ? reply() : Response.json(reply)
   }
@@ -74,11 +75,73 @@ await test('distinguishes no published release, throttling, and network failures
     [() => new Response(null, { status: 403, headers: { 'x-ratelimit-remaining': '0' } }), { status: 'unavailable', reason: 'rate-limit' }],
     [new TypeError('network failure with private detail'), { status: 'unavailable', reason: 'network' }],
   ]) {
-    const { check, seen } = fixture(new Map([[getLatest, reply]]))
+    const { check, seen } = fixture(new Map([
+      [getLatest, reply], [publicLatest, () => new Response(null, { status: 503 })],
+    ]))
     assert.deepEqual(await check(), expected)
     assert.deepEqual(await check(), expected)
-    assert.equal(seen.length, 1)
+    assert.equal(seen.length, expected.reason === 'rate-limit' ? 2 : 1)
   }
+})
+
+const publicRefs = `${origin}.git/info/refs?service=git-upload-pack`
+const rawManifest = `https://raw.githubusercontent.com/Huaxidesu/dsh-loopback-direct/${commit}/package.json`
+const packet = (line) => (Buffer.byteLength(line) + 4).toString(16).padStart(4, '0') + line
+
+function throttledFixture ({ location = result.latest.url, refs, manifest = { name, version: '1.10.0' }, asset = true } = {}) {
+  const advertisement = packet('# service=git-upload-pack\n') + '0000' + (refs ?? (
+    packet(`${oldCommit} HEAD\u0000thin-pack symref=HEAD:refs/heads/main\n`) +
+    packet(`${tagObject} refs/tags/${tag}\n`) + packet(`${commit} refs/tags/${tag}^{}\n`)
+  )) + '0000'
+  const seen = []
+  const fetchImpl = async (url, init) => {
+    seen.push({ url, init })
+    if (url === api + getLatest) return new Response(null, { status: 403, headers: { 'x-ratelimit-remaining': '0' } })
+    if (url === publicLatest) return new Response(null, { status: 302, headers: { location } })
+    if (url === publicRefs) return new Response(advertisement, { headers: { 'content-type': 'application/x-git-upload-pack-advertisement' } })
+    if (url === rawManifest) return Response.json(manifest)
+    if (url === zipUrl) return asset ? new Response(null, {
+      status: 302,
+      headers: { location: 'https://release-assets.githubusercontent.com/github-production-release-asset/123/asset?signature=example' },
+    }) : new Response(null, { status: 404 })
+    throw new Error(`unexpected fetch ${url}`)
+  }
+  return { seen, check: createReleaseChecker({ fetchImpl }) }
+}
+
+await test('discovers a stable pinned Release through public GitHub endpoints if the API is rate limited', async () => {
+  const { check, seen } = throttledFixture()
+  const found = await check()
+  assert.deepEqual(found, { ...result, latest: { ...result.latest, zipUrl } })
+  assert.deepEqual(seen.map(call => call.url).slice(0, 3), [api + getLatest, publicLatest, publicRefs])
+  assert.deepEqual(new Set(seen.map(call => call.url).slice(3)), new Set([rawManifest, zipUrl]))
+  assert.ok(seen.every(({ init }) => init.signal instanceof AbortSignal && init.redirect !== 'follow'))
+  assert.equal(seen.find(call => call.url === zipUrl).init.method, 'HEAD')
+  assert.deepEqual(await throttledFixture({ asset: false }).check(), result)
+  const lightweight = throttledFixture({ refs: packet(`${commit} refs/tags/${tag}\n`) })
+  assert.deepEqual(await lightweight.check(), found)
+})
+
+await test('retains the API limit result if public metadata cannot identify a matching pinned Release', async () => {
+  const limited = { status: 'unavailable', reason: 'rate-limit' }
+  for (const location of [
+    'https://somewhere.invalid/releases/tag/v1.10.0', `${origin}/releases/tag/v1.10.0-rc.1`,
+    `${origin}/releases/tag/v1.10.0?other=1`, `${origin}/releases/tag/v1.010.0`,
+  ]) {
+    const { check, seen } = throttledFixture({ location })
+    assert.deepEqual(await check(), limited)
+    assert.equal(seen.length, 2)
+  }
+  for (const refs of [
+    'oops', packet(`${commit} refs/tags/${tag}^{}\n`),
+    packet(`${commit} refs/tags/${tag}\n`) + packet(`${oldCommit} refs/tags/${tag}\n`),
+    packet(`${commit} refs/tags/${tag}0\n`),
+  ]) {
+    const { check, seen } = throttledFixture({ refs })
+    assert.deepEqual(await check(), limited)
+    assert.equal(seen.length, 3)
+  }
+  assert.deepEqual(await throttledFixture({ manifest: { name, version: '1.11.0' } }).check(), limited)
 })
 
 await test('rejects prereleases, malformed tags, unsafe refs, and annotated tag cycles', async () => {

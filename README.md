@@ -127,7 +127,7 @@ curl -X PUT http://127.0.0.1:18787/__bili/config \
 - **离线安装**：把 Release 的 `dsh-loopback-direct-offline.zip` 复制到目标机器。解压后按内附说明，在 DSH 的 **添加插件** 输入 `.tgz` 文件绝对路径。
 - **已从目录或 `.tgz` 安装**：仍可检查版本和下载安装包。要启用 DSH 内的原位更新，先在插件管理器中移除旧包，再用 Release 提供的固定 Git 地址安装一次。
 
-每次打开更新页会检查正式版。「重新检查」复用 Host 一分钟内的成功结果或 15 秒内的失败结果，以减少对 GitHub 的请求。更新页管理回环直连插件的版本。升级 billion-context 后，在 **设置 → 回环直连** 检查转发器补丁。
+每次打开更新页会检查正式版。「重新检查」复用一分钟内的成功结果或 15 秒内的失败结果。GitHub API 限流时，更新页会用公开发布页和 Git 标签查询正式版。升级 billion-context 后，在 **设置 → 回环直连** 检查转发器补丁。
 
 首次安装后打开 **设置 → 回环直连**，按页面提示处理补丁和重启，再验证本机模型。完整步骤见 [安装与更新说明](https://github.com/Huaxidesu/dsh-loopback-direct/blob/main/docs/INSTALL.md)。
 
