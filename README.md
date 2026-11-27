@@ -92,3 +92,30 @@ curl -X PUT http://127.0.0.1:18787/__bili/config \
 - DSH Desktop 2.0.24-next
 
 其它版本：`status` 会显示 `patchable` 与锚点数量。锚点不唯一或缺失时插件拒绝打补丁，不会盲改。
+
+## 安装
+
+在 DSH 的 **插件** 页面选择「添加插件」，指向本目录；或者让 Agent 装：
+
+```
+plugin_manager install_bundle  target = <本目录绝对路径>
+```
+
+安装后打开 **设置 → 回环直连**，状态卡片会显示转发器、版本、补丁状态与最近一次出站决策。
+若 billion-context 尚未打补丁，点「打补丁」然后重启 DSH，再点「验证」。
+
+也可以直接用 CLI（不装插件也能用）：
+
+```bash
+node cli.js status
+node cli.js patch && # 重启 DSH
+node cli.js verify
+```
+
+## 支持的版本
+
+`billion-context` 0.1.216 已实测。其它版本用 `status` 查：锚点数量必须恰好为 1，否则插件拒绝打补丁。
+
+## License
+
+MIT
