@@ -1,0 +1,65 @@
+{
+  "name": "dsh-loopback-direct",
+  "version": "1.0.0",
+  "description": "让 DSH 的 WorkBuddy 等本机模型在开启手动代理后仍然直连：给 billion-context 转发器的第二跳补上回环地址分流",
+  "type": "module",
+  "license": "MIT",
+  "author": "Huaxidesu",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "proxy",
+    "loopback",
+    "workbuddy",
+    "billion-context"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Huaxidesu/dsh-loopback-direct.git"
+  },
+  "homepage": "https://github.com/Huaxidesu/dsh-loopback-direct#readme",
+  "bugs": {
+    "url": "https://github.com/Huaxidesu/dsh-loopback-direct/issues"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./core": "./lib/core.js"
+  },
+  "bin": {
+    "dsh-loopback-direct": "./cli.js"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cli.js",
+    "lib",
+    "test",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
+    }
+  },
+  "scripts": {
+    "test": "node test/core.test.js"
+  }
+}

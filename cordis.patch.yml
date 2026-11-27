@@ -1,0 +1,9 @@
+# dsh-loopback-direct — 回环直连（billion-context 第二跳分流）
+#
+# ⚠ 只注册一个 Host 侧 entry。它不参与运行时转发，只提供：
+#   - GET  /plugins/dsh-loopback-direct/status   只读诊断
+#   - POST /plugins/dsh-loopback-direct/action   patch / revert / verify
+# 真正的分流由 billion-context 转发器自己完成（见 README 的修法一节）。
+- insert:
+    - id: dsh-loopback-direct
+      name: 'dsh-loopback-direct'

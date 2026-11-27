@@ -1,0 +1,39 @@
+{
+  "meta": {
+    "title": "Loopback Direct",
+    "description": "Keep local model servers such as WorkBuddy off the manual proxy by adding loopback routing to the billion-context forwarder second hop. Patch, revert, and verify from Settings > Loopback Direct."
+  },
+  "name": "Loopback Direct",
+  "description": "Keep local model servers (WorkBuddy) off the manual proxy by adding loopback routing to the billion-context forwarder's second hop",
+  "section": {
+    "title": "Loopback Direct",
+    "subtitle": "Local models bypass the proxy"
+  },
+  "status": {
+    "forwarder": "Forwarder",
+    "running": "Running",
+    "notRunning": "Not started",
+    "install": "Install",
+    "version": "Version",
+    "patched": "Patched",
+    "notPatched": "Not patched",
+    "patchable": "Patchable",
+    "notPatchable": "Not patchable",
+    "restartPending": "Restart DSH to apply",
+    "confirmed": "Split routing active",
+    "notConfirmed": "Not yet confirmed by the forwarder",
+    "lastDecision": "Last egress decision"
+  },
+  "action": {
+    "patch": "Patch",
+    "revert": "Revert",
+    "verify": "Verify",
+    "patching": "Patching…",
+    "verifying": "Verifying…"
+  },
+  "hint": {
+    "noForwarder": "The forwarder has not started yet. Start DSH first.",
+    "noInstall": "billion-context install not found; set BILI_CONTEXT_DIR.",
+    "restart": "The forwarder is a separate process; a disk change needs a DSH restart."
+  }
+}

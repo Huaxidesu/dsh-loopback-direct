@@ -1,0 +1,39 @@
+{
+  "meta": {
+    "title": "回环直连",
+    "description": "让 WorkBuddy 等本机模型在开启手动代理后仍然直连：给 billion-context 转发器的第二跳补上回环地址分流。设置 → 回环直连 里可以打补丁、回滚和验证。"
+  },
+  "name": "回环直连",
+  "description": "让 WorkBuddy 等本机模型在开启手动代理后仍然直连（给 billion-context 转发器第二跳补上回环分流）",
+  "section": {
+    "title": "回环直连",
+    "subtitle": "本机模型不走代理"
+  },
+  "status": {
+    "forwarder": "转发器",
+    "running": "运行中",
+    "notRunning": "未启动",
+    "install": "安装位置",
+    "version": "版本",
+    "patched": "已打补丁",
+    "notPatched": "未打补丁",
+    "patchable": "可以打补丁",
+    "notPatchable": "不能打补丁",
+    "restartPending": "改完需要重启 DSH",
+    "confirmed": "分流已启用",
+    "notConfirmed": "尚未拿到转发器确认",
+    "lastDecision": "最近一次出站决策"
+  },
+  "action": {
+    "patch": "打补丁",
+    "revert": "回滚",
+    "verify": "验证",
+    "patching": "正在打补丁…",
+    "verifying": "正在验证…"
+  },
+  "hint": {
+    "noForwarder": "转发器没启动过，先启动 DSH。",
+    "noInstall": "没找到 billion-context 安装目录，可用 BILI_CONTEXT_DIR 指定。",
+    "restart": "转发器是独立进程，改完磁盘必须重启 DSH 才生效。"
+  }
+}
