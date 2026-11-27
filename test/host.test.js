@@ -1,119 +1,113 @@
-/**
- * 用假的 Cordis ctx 验证 Host 侧接线（不需要重启 DSH）。
- * 检查：apply 不抛、两条路由都注册、路由行为正确。
- */
 import assert from 'node:assert/strict'
+import fs from 'node:fs'
 import http from 'node:http'
-
+import os from 'node:os'
+import path from 'node:path'
+import { once } from 'node:events'
 import { apply, inject } from '../index.js'
+import { PATCH_ANCHOR, PATCH_LINE, inspectSource, readVerifyRecord, stateDir } from '../lib/core.js'
 
-const routes = []
-const effects = []
+const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'loopback-host-'))
+const dist = path.join(temp, 'fake-package', 'dist')
+const fixtureEnv = {
+  BILI_CONTEXT_DIR: path.dirname(dist),
+  XDG_STATE_HOME: path.join(temp, 'state'),
+  DSH_LOOPBACK_DIRECT_NO_AUTOHEAL: '1',
+}
+const priorEnv = Object.fromEntries(Object.keys(fixtureEnv).map(key => [key, process.env[key]]))
+Object.assign(process.env, fixtureEnv)
 
+const pluginPath = '/plugins/dsh-loopback-direct'
+const routes = new Map()
 const ctx = {
   inject (deps, fn) {
-    assert.deepEqual(deps, ['webServer'], 'inject 必须是 webServer')
-    fn(serverCtx)
+    assert.deepEqual(deps, ['webServer'])
+    fn(ctx)
   },
-  effect (fn, label) {
-    effects.push(label)
-    return fn()
-  },
-  webServer: undefined,
-}
-
-const serverCtx = {
-  effect (fn, label) {
-    effects.push(label)
-    const disposer = fn()
-    return typeof disposer === 'function' ? disposer : () => {}
-  },
+  effect (fn) { return fn() },
   webServer: {
     register (route) {
-      routes.push(route)
-      return () => {}
+      assert.equal(route.kind, 'exact')
+      assert.ok(!routes.has(route.path))
+      routes.set(route.path, route)
+      return () => routes.delete(route.path)
     },
   },
 }
 
-apply(ctx)
+let server
+try {
+  apply(ctx)
+  assert.deepEqual(inject, [])
+  assert.deepEqual([...routes.keys()].sort(), ['action', 'release', 'status'].map(key => `${pluginPath}/${key}`))
 
-assert.equal(inject.length, 0, 'inject 导出应为空数组（不强制依赖宿主服务）')
-assert.equal(routes.length, 2, '应注册两条路由')
-assert.equal(routes[0].path, '/plugins/dsh-loopback-direct/status')
-assert.equal(routes[1].path, '/plugins/dsh-loopback-direct/action')
-assert.equal(routes[0].kind, 'exact')
-assert.equal(routes[1].kind, 'exact')
-assert.ok(effects.length >= 2, '应有 effect 包裹')
-
-/** 起一个真 HTTP server，把路由挂上去，用真请求验证。 */
-const server = http.createServer((req, res) => {
-  const path = (req.url || '').split('?')[0]
-  const route = routes.find((r) => r.path === path)
-  if (!route) { res.writeHead(404); res.end('nope'); return }
-  Promise.resolve(route.handler(req, res)).catch((error) => {
-    res.writeHead(500); res.end(String(error))
+  fs.mkdirSync(dist, { recursive: true })
+  fs.mkdirSync(stateDir(), { recursive: true })
+  const version = '0.1.216'
+  const source = `function decision (target, globalProxy, fallback) {${PATCH_LINE}${PATCH_ANCHOR}}}`
+  fs.writeFileSync(path.join(dist, 'index.js'), source)
+  fs.writeFileSync(path.join(path.dirname(dist), 'package.json'), JSON.stringify({ version }))
+  const target = 'http://127.0.0.1:47199'
+  server = http.createServer((req, res) => {
+    if (req.url === '/__bili/upstream') {
+      res.setHeader('content-type', 'application/json')
+      return res.end(JSON.stringify({ mode: 'direct', connectionUrl: `${target}/v1/chat/completions` }))
+    }
+    if (req.url === `/bili/${target}/v1/models`) {
+      res.writeHead(401)
+      return res.end('upstream authentication required')
+    }
+    const route = routes.get(req.url)
+    if (!route) { res.writeHead(404); return res.end() }
+    Promise.resolve(route.handler(req, res)).catch(error => {
+      res.writeHead(500)
+      res.end(String(error))
+    })
   })
-})
+  server.listen(0, '127.0.0.1')
+  await once(server, 'listening')
+  const origin = `http://127.0.0.1:${server.address().port}`
+  fs.writeFileSync(path.join(stateDir(), 'proxy-origin'), JSON.stringify({
+    origin, codeFingerprint: inspectSource(source, version).hash,
+  }))
+  const get = (url, init) => fetch(`${origin}${pluginPath}/${url}`, { ...init, signal: AbortSignal.timeout(5000) })
+  const action = (name) => get('action', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ action: name }),
+  })
 
-await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
-const { port } = server.address()
-const base = `http://127.0.0.1:${port}`
+  let response = await get('status')
+  assert.equal(response.status, 200)
+  const status = await response.json()
+  assert.equal(status.plugin, 'dsh-loopback-direct')
+  assert.equal(status.install.root, fixtureEnv.BILI_CONTEXT_DIR)
+  assert.equal(status.flags.patched, true)
+  assert.equal(status.flags.restartPending, false)
+  assert.equal(status.flags.confirmed, false)
+  assert.equal((await get('status', { method: 'POST' })).status, 405)
+  assert.equal((await get('action')).status, 405)
+  assert.equal((await get('release', { method: 'POST' })).status, 405)
+  assert.equal((await get('unknown')).status, 404)
 
-// 1) status
-let response = await fetch(`${base}/plugins/dsh-loopback-direct/status`)
-assert.equal(response.status, 200)
-const status = await response.json()
-assert.equal(status.ok, true)
-assert.equal(status.plugin, 'dsh-loopback-direct')
-assert.ok(status.install, 'status 必须带 install')
-assert.ok(status.install.found, '本机应能找到 billion-context 安装')
-assert.equal(typeof status.install.patchable, 'boolean')
-assert.ok(status.flags, 'status 必须带 flags')
-for (const key of ['running', 'patched', 'patchable', 'restartPending', 'confirmed']) {
-  assert.equal(typeof status.flags[key], 'boolean', `flags.${key} 必须是 boolean`)
+  response = await action('unknown')
+  assert.equal(response.status, 400)
+  assert.match((await response.json()).error, /patch, revert or verify/)
+  response = await action('verify')
+  assert.equal(response.status, 200)
+  const verification = await response.json()
+  assert.equal(verification.ok, true)
+  assert.equal(verification.probe.status, 401)
+  assert.equal(verification.probe.verdict, 'reached')
+  assert.equal(verification.confirmed, true)
+  assert.equal(readVerifyRecord().port, 47199)
+  assert.equal((await (await get('status')).json()).flags.confirmed, true)
+  console.log('host wiring ok: status, release, actions, and isolated verification')
+} finally {
+  if (server?.listening) await new Promise(resolve => server.close(resolve))
+  for (const [key, value] of Object.entries(priorEnv)) {
+    if (value === undefined) delete process.env[key]
+    else process.env[key] = value
+  }
+  fs.rmSync(temp, { recursive: true, force: true })
 }
-
-// 2) 方法闸
-response = await fetch(`${base}/plugins/dsh-loopback-direct/status`, { method: 'POST' })
-assert.equal(response.status, 405)
-response = await fetch(`${base}/plugins/dsh-loopback-direct/action`)
-assert.equal(response.status, 405)
-
-// 3) 非法 action
-response = await fetch(`${base}/plugins/dsh-loopback-direct/action`, {
-  method: 'POST',
-  headers: { 'content-type': 'application/json' },
-  body: JSON.stringify({ action: 'nope' }),
-})
-assert.equal(response.status, 400)
-const bad = await response.json()
-assert.match(bad.error, /patch, revert or verify/)
-
-// 4) 未知路径
-response = await fetch(`${base}/plugins/dsh-loopback-direct/nothing`)
-assert.equal(response.status, 404)
-
-// 5) verify（真实跑一次：本机转发器在跑，会走真实 /bili/ 两跳）
-response = await fetch(`${base}/plugins/dsh-loopback-direct/action`, {
-  method: 'POST',
-  headers: { 'content-type': 'application/json' },
-  body: JSON.stringify({ action: 'verify' }),
-})
-assert.equal(response.status, 200)
-const verified = await response.json()
-assert.equal(verified.ok, true, `verify 应成功：${JSON.stringify(verified).slice(0, 300)}`)
-assert.ok(verified.probe, 'verify 必须带 probe')
-assert.ok(['reached', 'proxy-failure', 'unreachable'].includes(verified.probe.verdict), verified.probe.verdict)
-assert.equal(typeof verified.confirmed, 'boolean')
-console.log('verify:', JSON.stringify({
-  upstream: verified.upstream,
-  verdict: verified.probe.verdict,
-  status: verified.probe.status,
-  ms: verified.probe.ms,
-  decision: verified.lastDecision && verified.lastDecision.source,
-  confirmed: verified.confirmed,
-}))
-
-server.close()
-console.log('host wiring ok: 2 routes, status/action/verify 全部符合预期')

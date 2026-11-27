@@ -16,6 +16,8 @@ window.__ModuleLoader__.load({
     const NS = 'loopbackDirect'
     const STATUS_URL = '/plugins/dsh-loopback-direct/status'
     const ACTION_URL = '/plugins/dsh-loopback-direct/action'
+    const RELEASE_URL = '/plugins/dsh-loopback-direct/release'
+    const RELEASES_PAGE = 'https://github.com/Huaxidesu/dsh-loopback-direct/releases'
 
     const zh = {
       nav: '回环直连',
@@ -60,6 +62,26 @@ window.__ModuleLoader__.load({
       guard: '升级监护',
       guardOn: '已开启（每次打开本页都会检查）',
       healedTimes: '已自动重打 {n} 次',
+      releaseTab: '回环直连更新',
+      releaseSettings: '在左侧「插件 → 回环直连更新」查看本插件的新版本。',
+      releaseIntro: '查看回环直连在 GitHub 上发布的正式版本。',
+      installedVersion: '已安装版本',
+      latestVersion: '最新正式版',
+      releaseChecking: '正在检查更新…',
+      releaseCheckAgain: '重新检查',
+      releaseReady: '有新版本',
+      releaseCurrent: '已是最新正式版或更高版本',
+      releaseNone: '暂未发布正式版',
+      releaseUnavailable: '暂时无法读取 GitHub Release，请稍后重试。',
+      releaseRateLimit: 'GitHub 暂时限制了检查次数，请稍后重试。',
+      releaseUnknownVersion: '无法识别已安装的版本。',
+      releaseManual: '这份安装需要手动换包。打开发布页获取离线包，或按发布说明通过 Git 安装一次，以后可在此处直接更新。',
+      releaseSourceUnknown: '无法确认当前安装来源。可从发布页查看安装和更新说明。',
+      releaseNoAccess: '当前客户端没有更新插件的权限。',
+      releaseUpdate: '更新…',
+      releaseNotes: '查看发布说明',
+      releaseZip: '下载离线安装包（ZIP）',
+      releaseZipHint: '可以把 ZIP 发给另一台机器。解压后按内附说明安装。',
     }
 
     const en = {
@@ -105,6 +127,26 @@ window.__ModuleLoader__.load({
       guard: 'Upgrade guard',
       guardOn: 'Enabled (checked every time this page opens)',
       healedTimes: 'Auto re-patched {n} time(s)',
+      releaseTab: 'Loopback Direct updates',
+      releaseSettings: 'Find new versions of this plugin under Plugins → Loopback Direct updates.',
+      releaseIntro: 'Check GitHub for stable Loopback Direct releases.',
+      installedVersion: 'Installed version',
+      latestVersion: 'Latest stable release',
+      releaseChecking: 'Checking for updates…',
+      releaseCheckAgain: 'Check again',
+      releaseReady: 'Update available',
+      releaseCurrent: 'At or above the latest stable release',
+      releaseNone: 'No stable releases yet',
+      releaseUnavailable: 'Unable to read GitHub releases. Try again later.',
+      releaseRateLimit: 'GitHub is temporarily limiting update checks. Try again later.',
+      releaseUnknownVersion: 'Unable to identify the installed version.',
+      releaseManual: 'This installation is updated manually. Get the offline package from GitHub, or switch to a Git installation once to update here in the future.',
+      releaseSourceUnknown: 'Unable to confirm the installation source. See GitHub for installation and update instructions.',
+      releaseNoAccess: 'This client does not have permission to update plugins.',
+      releaseUpdate: 'Update…',
+      releaseNotes: 'View release notes',
+      releaseZip: 'Download the offline ZIP',
+      releaseZipHint: 'To install on another computer, extract the ZIP and follow the included guide.',
     }
 
     const S = {
@@ -138,9 +180,10 @@ window.__ModuleLoader__.load({
               ? 'var(--dsw-alias-state-error-primary)'
               : 'var(--dsw-alias-label-secondary)',
       }),
-      btn: (primary) => ({
+      btn: (primary, disabled = false) => ({
         appearance: 'none',
-        cursor: 'pointer',
+        cursor: disabled ? 'default' : 'pointer',
+        opacity: disabled ? 0.55 : 1,
         fontSize: '13px',
         padding: '6px 14px',
         borderRadius: '8px',
@@ -294,11 +337,72 @@ window.__ModuleLoader__.load({
                   verify.confirmed ? t('confirmed') : t('notConfirmed'))))
         ) : null,
 
+        h('div', { style: S.hint }, t('releaseSettings')),
         h('div', { style: S.hint }, t('cli')))
+    }
+
+    function ReleaseTab({ api, t, update, useRemoteAccess }) {
+      const canUpdate = useRemoteAccess('pluginManager/updateBundle')
+      const [info, setInfo] = useState(null)
+      const [attempt, setAttempt] = useState(0)
+
+      useEffect(() => {
+        const controller = new AbortController()
+        api.release(controller.signal).then(
+          result => { if (!controller.signal.aborted) setInfo(result) },
+          () => { if (!controller.signal.aborted) setInfo({ status: 'unavailable' }) },
+        )
+        return () => controller.abort()
+      }, [api, attempt])
+
+      const available = info?.status === 'available'
+      const message = {
+        available: 'releaseReady',
+        current: 'releaseCurrent',
+        'no-release': 'releaseNone',
+        'unknown-version': 'releaseUnknownVersion',
+        unavailable: info?.reason === 'rate-limit' ? 'releaseRateLimit' : 'releaseUnavailable',
+      }[info?.status] ?? (info === null ? 'releaseChecking' : 'releaseUnavailable')
+      const hint = available && (info.installMode === 'manual'
+        ? 'releaseManual'
+        : !info.target ? 'releaseSourceUnknown' : !canUpdate ? 'releaseNoAccess' : null)
+      const releaseNotes = info?.latest?.url ?? RELEASES_PAGE
+
+      return h('div', { style: { ...S.wrap, maxWidth: '640px' } },
+        h('div', { style: S.intro }, t('releaseIntro')),
+        h('div', { style: S.card },
+          h(Row, { label: t('installedVersion') }, info?.installedVersion ?? '—'),
+          h(Row, { label: t('latestVersion') }, info?.latest?.version ?? '—'),
+          h('div', { role: 'status', style: S.intro }, t(message)),
+          hint ? h('div', { style: S.hint }, t(hint)) : null,
+          h('div', { style: { ...S.actions, alignItems: 'center' } },
+            available && info.target && canUpdate
+              ? h('button', { type: 'button', style: S.btn(true), onClick: () => update(info.target) }, t('releaseUpdate'))
+              : null,
+            h('button', {
+              type: 'button', style: S.btn(false, info === null), disabled: info === null,
+              onClick: () => { setInfo(null); setAttempt(value => value + 1) },
+            }, t('releaseCheckAgain')),
+            h('a', {
+              href: releaseNotes, target: '_blank', rel: 'noopener noreferrer',
+              style: { color: 'var(--dsw-alias-brand-primary)', fontSize: '13px' },
+            }, t('releaseNotes'))),
+          info?.latest?.zipUrl
+            ? h('div', { style: S.hint },
+              h('a', {
+                href: info.latest.zipUrl, target: '_blank', rel: 'noopener noreferrer',
+                style: { color: 'var(--dsw-alias-brand-primary)' },
+              }, t('releaseZip')), ' · ', t('releaseZipHint'))
+            : null))
     }
 
     function createApi() {
       return {
+        async release(signal) {
+          const response = await fetch(RELEASE_URL, { credentials: 'same-origin', signal })
+          if (!response.ok) throw new Error(`release ${response.status}`)
+          return response.json()
+        },
         async status() {
           const response = await fetch(STATUS_URL, { credentials: 'same-origin' })
           if (!response.ok) throw new Error(`status ${response.status}`)
@@ -347,6 +451,12 @@ window.__ModuleLoader__.load({
       } catch {
         // slots 不可用时静默降级，CLI 仍然可用
       }
+      ctx.slots.inject('plugins.tab', () => ctx.slots.register({
+        name: 'plugins.tab',
+        id: 'dsh-loopback-direct.updates',
+        order: 20,
+        label: () => t('releaseTab'),
+      }, ({ update, useRemoteAccess }) => h(ReleaseTab, { api, t, update, useRemoteAccess })))
     }
 
     return { apply, inject }

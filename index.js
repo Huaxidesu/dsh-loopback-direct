@@ -2,9 +2,9 @@
  * dsh-loopback-direct — Host half.
  *
  * 职责：
- *  1. 状态路由：/plugins/dsh-loopback-direct/status  （只读诊断）
- *  2. 动作路由：/plugins/dsh-loopback-direct/action  （patch / revert / verify）
- *  3. 设置页卡片的数据面
+ *  1. 状态路由：/plugins/dsh-loopback-direct/status（诊断和升级监护）
+ *  2. 动作路由：/plugins/dsh-loopback-direct/action（patch / revert / verify）
+ *  3. 更新检查：/plugins/dsh-loopback-direct/release（只读）
  *
  * ★ 本插件不参与运行时转发：真正的分流由 billion-context 转发器自己完成。
  *   我们只负责「发现 → 打补丁 → 让转发器确认 → 可回滚」这一整套可维护流程。
@@ -35,10 +35,13 @@ import {
   PATCH_LINE,
   stateDir,
 } from './lib/core.js'
+import { createReleaseChecker, describeRelease } from './lib/release.js'
 
 const NAME = 'dsh-loopback-direct'
 const STATUS_PATH = `/plugins/${NAME}/status`
 const ACTION_PATH = `/plugins/${NAME}/action`
+const RELEASE_PATH = `/plugins/${NAME}/release`
+const runningVersion = JSON.parse(fs.readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version
 const KNOWN_VERSION_NOTE = '0.1.216 已实测；其它版本请先看 status 的 patchable 字段'
 /** 版本守卫的巡检间隔：billion-context 在会话中途被升级也能在半分钟内自愈。 */
 const HEAL_INTERVAL_MS = 30 * 1000
@@ -256,6 +259,29 @@ function registerStatusRoute (ctx) {
   }), `${NAME}: status route`)
 }
 
+function registerReleaseRoute (ctx) {
+  const checkRelease = createReleaseChecker()
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact',
+    path: RELEASE_PATH,
+    handler: async (req, res) => {
+      if (req.method !== 'GET') return sendJson(res, 405, { error: 'method not allowed' })
+      if (!requireLoopback(req, res)) return
+      const installedBundle = async () => {
+        try {
+          const bundles = await ctx.get('pluginManager')?.listBundles()
+          return bundles?.find(bundle => bundle.name === NAME && bundle.installed)
+        } catch {
+          // Release discovery also works on hosts that cannot inventory the current installation.
+          return undefined
+        }
+      }
+      const [release, bundle] = await Promise.all([checkRelease(), installedBundle()])
+      return sendJson(res, 200, describeRelease(release, bundle, runningVersion))
+    },
+  }), `${NAME}: release route`)
+}
+
 function registerActionRoute (ctx) {
   ctx.effect(() => ctx.webServer.register({
     kind: 'exact',
@@ -399,6 +425,7 @@ export function apply (ctx) {
   ctx.inject(['webServer'], (serverCtx) => {
     registerStatusRoute(serverCtx)
     registerActionRoute(serverCtx)
+    registerReleaseRoute(serverCtx)
   })
   // 没有 webServer 也不报错：CLI 仍然可用。
 }

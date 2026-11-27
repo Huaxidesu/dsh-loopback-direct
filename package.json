@@ -1,6 +1,6 @@
 {
   "name": "dsh-loopback-direct",
-  "version": "1.1.0",
+  "version": "1.2.0-rc.1",
   "description": "让 DSH 的 WorkBuddy 等本机模型在开启手动代理后仍然直连：给 billion-context 转发器的第二跳补上回环地址分流",
   "type": "module",
   "license": "MIT",
@@ -41,6 +41,7 @@
     "cordis.patch.yml",
     "locale/*.json",
     "icon.svg",
+    "docs",
     "README.md",
     "LICENSE"
   ],
@@ -60,6 +61,6 @@
     }
   },
   "scripts": {
-    "test": "node test/core.test.js"
+    "test": "node test/core.test.js && node test/release.test.js && node test/host.test.js"
   }
 }
